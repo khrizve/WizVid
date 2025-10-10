@@ -40,14 +40,14 @@ Ensure you have the following installed:
 
 ```bash
 git clone https://github.com/khrizve/Video_Downloader.git
-cd wizvid_init
+cd wizvid
 pip install -r requirements.txt
 ```
 
 ### ▶️ Run the Application
 
 ```bash
-python wizvid.py
+python wizvid_src.py
 ```
 
 ---
