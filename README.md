@@ -76,7 +76,7 @@ Contributions are welcome! Feel free to fork the repo and submit pull requests.
 ## 🌐 Connect
 
 * 🧠 Author: Sorcerer
-* 🕊️ Twitter: [Kh Rizve Reza](https://x.com/rizve_19)
+* 🕊️ Twitter: [Kh Rizve](https://x.com/rizve_19)
 * 💼 Portfolio: [Sorcerer](https://rizve.netlify.app/)
 
 ---
