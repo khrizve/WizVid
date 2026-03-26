@@ -1,8 +1,14 @@
 import sys
 import re
+import json
 import yt_dlp
 import os
+import shutil
+import zipfile
+import tarfile
 import urllib.request
+import subprocess
+import platform
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QTextEdit, QPushButton, QFileDialog, \
     QProgressBar, QComboBox, QGraphicsOpacityEffect, QHBoxLayout, QDialog, QMessageBox
 from PyQt6.QtCore import QPropertyAnimation, QEasingCurve, Qt, QUrl, QThread, pyqtSignal, QObject, QSettings
@@ -13,6 +19,205 @@ import time
 class DownloadCancelledException(Exception):
     pass
 
+
+# ---------------------------------------------------------------------------
+# yt-dlp version checker / auto-updater
+# ---------------------------------------------------------------------------
+
+class YtDlpUpdateWorker(QObject):
+    """Checks PyPI for the latest yt-dlp version and upgrades if needed."""
+    status        = pyqtSignal(str)   # status messages for the log
+    update_found  = pyqtSignal(str, str)  # (current_version, latest_version)
+    up_to_date    = pyqtSignal(str)   # current_version
+    update_done   = pyqtSignal(str)   # new_version after successful update
+    update_failed = pyqtSignal(str)   # error message
+
+    def run(self):
+        try:
+            current_version = yt_dlp.version.__version__
+            self.status.emit(f"🔍 Checking yt-dlp version (installed: {current_version}) …")
+
+            with urllib.request.urlopen(
+                "https://pypi.org/pypi/yt-dlp/json", timeout=10
+            ) as resp:
+                data = resp.read()
+
+            latest_version = json.loads(data)["info"]["version"]
+
+            if latest_version == current_version:
+                self.status.emit(f"✅ yt-dlp is up to date ({current_version})")
+                self.up_to_date.emit(current_version)
+                return
+
+            self.status.emit(
+                f"⬆️  New yt-dlp version available: {latest_version} "
+                f"(installed: {current_version}). Updating …"
+            )
+            self.update_found.emit(current_version, latest_version)
+
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                self.status.emit(f"✅ yt-dlp updated to {latest_version} successfully!")
+                self.update_done.emit(latest_version)
+            else:
+                err = result.stderr.strip() or result.stdout.strip()
+                self.status.emit(f"❌ yt-dlp update failed: {err}")
+                self.update_failed.emit(err)
+
+        except Exception as exc:
+            self.status.emit(f"⚠️  Could not check yt-dlp version: {exc}")
+            self.update_failed.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg helpers
+# ---------------------------------------------------------------------------
+
+def _ffmpeg_bin_name():
+    return "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+
+
+def _local_ffmpeg_dir():
+    """Directory next to this script where we store a downloaded ffmpeg."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg_bin")
+
+
+def _find_system_ffmpeg():
+    """Return the full path to ffmpeg if it is already on PATH, else None."""
+    return shutil.which("ffmpeg")
+
+
+def _get_ffmpeg_download_url():
+    """
+    Return (url, archive_type) for the latest static ffmpeg build.
+    Uses the well-known johnvansickle builds for Linux and
+    gyan.dev builds for Windows.
+    """
+    machine = platform.machine().lower()
+
+    if sys.platform == "win32":
+        # gyan.dev essentials build – always up-to-date
+        url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        return url, "zip"
+    else:
+        # johnvansickle static builds for Linux
+        arch = "amd64" if ("x86_64" in machine or "amd64" in machine) else "arm64"
+        url = f"https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-{arch}-static.tar.xz"
+        return url, "tar"
+
+
+def _download_ffmpeg_to_local(status_callback=None):
+    """
+    Download ffmpeg and extract it into _local_ffmpeg_dir().
+    Returns the path to the ffmpeg executable, or None on failure.
+    status_callback(msg) is called with progress strings if provided.
+    """
+    local_dir = _local_ffmpeg_dir()
+    os.makedirs(local_dir, exist_ok=True)
+
+    url, archive_type = _get_ffmpeg_download_url()
+    archive_path = os.path.join(local_dir, "ffmpeg_archive" + (".zip" if archive_type == "zip" else ".tar.xz"))
+
+    def _report(msg):
+        if status_callback:
+            status_callback(msg)
+
+    _report(f"⬇️  Downloading ffmpeg from {url} …")
+
+    try:
+        def _reporthook(count, block_size, total_size):
+            if total_size > 0 and count % 200 == 0:
+                pct = min(100, int(count * block_size * 100 / total_size))
+                _report(f"⬇️  Downloading ffmpeg … {pct}%")
+
+        urllib.request.urlretrieve(url, archive_path, reporthook=_reporthook)
+    except Exception as exc:
+        _report(f"❌ Failed to download ffmpeg: {exc}")
+        return None
+
+    _report("📦 Extracting ffmpeg …")
+
+    try:
+        if archive_type == "zip":
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                zf.extractall(local_dir)
+        else:
+            with tarfile.open(archive_path, "r:xz") as tf:
+                tf.extractall(local_dir)
+    except Exception as exc:
+        _report(f"❌ Failed to extract ffmpeg: {exc}")
+        return None
+
+    # Find the ffmpeg binary somewhere inside the extracted tree
+    bin_name = _ffmpeg_bin_name()
+    for root, _dirs, files in os.walk(local_dir):
+        if bin_name in files:
+            ffmpeg_exe = os.path.join(root, bin_name)
+            if sys.platform != "win32":
+                os.chmod(ffmpeg_exe, 0o755)
+            _report(f"✅ ffmpeg installed at: {ffmpeg_exe}")
+            # Clean up archive
+            try:
+                os.remove(archive_path)
+            except OSError:
+                pass
+            return ffmpeg_exe
+
+    _report("❌ Could not locate ffmpeg binary after extraction.")
+    return None
+
+
+def ensure_ffmpeg(status_callback=None):
+    """
+    1. Check for system ffmpeg on PATH.
+    2. Check for a previously downloaded local copy.
+    3. Download ffmpeg if neither is found.
+
+    Returns the path to the ffmpeg executable (str), or None if everything failed.
+    """
+    def _report(msg):
+        if status_callback:
+            status_callback(msg)
+
+    # 1. System ffmpeg
+    sys_ffmpeg = _find_system_ffmpeg()
+    if sys_ffmpeg:
+        _report(f"✅ System ffmpeg found: {sys_ffmpeg}")
+        return sys_ffmpeg
+
+    # 2. Previously downloaded local copy
+    local_dir = _local_ffmpeg_dir()
+    bin_name = _ffmpeg_bin_name()
+    for root, _dirs, files in os.walk(local_dir):
+        if bin_name in files:
+            local_ffmpeg = os.path.join(root, bin_name)
+            _report(f"✅ Local ffmpeg found: {local_ffmpeg}")
+            return local_ffmpeg
+
+    # 3. Download
+    _report("⚠️  ffmpeg not found – downloading automatically …")
+    return _download_ffmpeg_to_local(status_callback=status_callback)
+
+
+# ---------------------------------------------------------------------------
+# Worker that resolves ffmpeg in a background thread so the UI stays responsive
+# ---------------------------------------------------------------------------
+
+class FfmpegSetupWorker(QObject):
+    finished = pyqtSignal(str)   # emits ffmpeg path (empty string = failed)
+    status   = pyqtSignal(str)   # status messages
+
+    def run(self):
+        path = ensure_ffmpeg(status_callback=self.status.emit)
+        self.finished.emit(path or "")
+
+
+# ---------------------------------------------------------------------------
+# Download worker
+# ---------------------------------------------------------------------------
 
 class DownloadWorker(QObject):
     progress_signal = pyqtSignal(dict)
@@ -85,6 +290,10 @@ class DownloadWorker(QObject):
         self._is_cancelled = True
 
 
+# ---------------------------------------------------------------------------
+# Preview worker
+# ---------------------------------------------------------------------------
+
 class PreviewWorker(QObject):
     preview_ready = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
@@ -105,6 +314,10 @@ class PreviewWorker(QObject):
         except Exception as e:
             self.error_signal.emit(f"Failed to fetch info for '{self.url}': {str(e)}")
 
+
+# ---------------------------------------------------------------------------
+# Preview dialog
+# ---------------------------------------------------------------------------
 
 class VideoPreviewDialog(QDialog):
     def __init__(self, info, parent=None):
@@ -178,26 +391,93 @@ class VideoPreviewDialog(QDialog):
         QDesktopServices.openUrl(QUrl(self.info['webpage_url']))
 
 
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
 class VideoDownloader(QWidget):
     def __init__(self):
         super().__init__()
         self.settings = QSettings('MyOrganization', 'WizVid')
         self.download_path = self.settings.value('download_path', os.path.expanduser('~'))
-        self.ffmpeg_path = self.get_ffmpeg_path()
+        self.ffmpeg_path = None          # resolved after startup
         self.init_ui()
         self.download_thread = None
         self.download_worker = None
         self.preview_thread = None
         self.current_playlist_folder = None
 
-    def get_ffmpeg_path(self):
-        if sys.platform == "win32":
-            return os.path.join(os.path.dirname(__file__), "ffmpeg", "bin", "ffmpeg.exe")
-        elif sys.platform == "darwin":
-            return os.path.join(os.path.dirname(__file__), "ffmpeg", "bin", "ffmpeg")
-        else:
-            return os.path.join(os.path.dirname(__file__), "ffmpeg", "bin", "ffmpeg")
+        # Resolve ffmpeg in the background so the window opens immediately
+        self._start_ffmpeg_setup()
+        # Check for yt-dlp updates in the background
+        self._start_ytdlp_update_check()
 
+    # ------------------------------------------------------------------
+    # ffmpeg setup (runs once at startup in a background thread)
+    # ------------------------------------------------------------------
+
+    def _start_ffmpeg_setup(self):
+        self.ffmpeg_thread = QThread()
+        self.ffmpeg_worker = FfmpegSetupWorker()
+        self.ffmpeg_worker.moveToThread(self.ffmpeg_thread)
+        self.ffmpeg_thread.started.connect(self.ffmpeg_worker.run)
+        self.ffmpeg_worker.status.connect(self.status.append)
+        self.ffmpeg_worker.finished.connect(self._on_ffmpeg_ready)
+        self.ffmpeg_worker.finished.connect(self.ffmpeg_thread.quit)
+        self.ffmpeg_thread.finished.connect(self.ffmpeg_worker.deleteLater)
+        self.ffmpeg_thread.finished.connect(self.ffmpeg_thread.deleteLater)
+        self.ffmpeg_thread.start()
+
+    def _on_ffmpeg_ready(self, path):
+        if path:
+            self.ffmpeg_path = path
+        else:
+            self.status.append(
+                "❌ ffmpeg could not be found or downloaded. "
+                "Audio extraction and merging may not work."
+            )
+
+    # ------------------------------------------------------------------
+    # yt-dlp update check (runs once at startup in a background thread)
+    # ------------------------------------------------------------------
+
+    def _start_ytdlp_update_check(self):
+        self.ytdlp_update_thread = QThread()
+        self.ytdlp_update_worker = YtDlpUpdateWorker()
+        self.ytdlp_update_worker.moveToThread(self.ytdlp_update_thread)
+        self.ytdlp_update_thread.started.connect(self.ytdlp_update_worker.run)
+        self.ytdlp_update_worker.status.connect(self.status.append)
+        self.ytdlp_update_worker.update_found.connect(self._on_ytdlp_update_found)
+        self.ytdlp_update_worker.update_done.connect(self._on_ytdlp_update_done)
+        self.ytdlp_update_worker.up_to_date.connect(
+            lambda v: self.status.append(f"✅ yt-dlp {v} is up to date.")
+        )
+        self.ytdlp_update_worker.update_failed.connect(
+            lambda e: self.status.append(f"⚠️  yt-dlp update check failed: {e}")
+        )
+        self.ytdlp_update_worker.update_done.connect(self.ytdlp_update_thread.quit)
+        self.ytdlp_update_worker.update_failed.connect(self.ytdlp_update_thread.quit)
+        self.ytdlp_update_worker.up_to_date.connect(self.ytdlp_update_thread.quit)
+        self.ytdlp_update_thread.finished.connect(self.ytdlp_update_worker.deleteLater)
+        self.ytdlp_update_thread.finished.connect(self.ytdlp_update_thread.deleteLater)
+        self.ytdlp_update_thread.start()
+
+    def _on_ytdlp_update_found(self, current, latest):
+        self.status.append(
+            f"🔔 yt-dlp update found! {current} → {latest}. Installing in background …"
+        )
+
+    def _on_ytdlp_update_done(self, new_version):
+        QMessageBox.information(
+            self,
+            "yt-dlp Updated",
+            f"✅ yt-dlp has been updated to version {new_version}.\n"
+            "Please restart WizVid to use the new version."
+        )
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
 
     def init_ui(self):
         self.setWindowTitle('✨ WizVid - Fantasy Downloader ✨')
@@ -490,7 +770,8 @@ class VideoDownloader(QWidget):
             'noprogress': True,
             'external_downloader_args': ['-loglevel', 'error', '-y']
         }
-        if self.ffmpeg_path and os.path.exists(self.ffmpeg_path):
+        # Supply ffmpeg location to yt-dlp if we resolved it
+        if self.ffmpeg_path and os.path.isfile(self.ffmpeg_path):
             options['ffmpeg_location'] = os.path.dirname(self.ffmpeg_path)
         if selected_format == 'Best Video':
             options['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
